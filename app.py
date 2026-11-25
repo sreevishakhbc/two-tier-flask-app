@@ -56,12 +56,7 @@ def home():
 
 @app.route("/health")
 def health():
-    try:
-        db = get_db()
-        db.close()
-        return {"status": "healthy"}, 200
-    except Exception:
-        return {"status": "unhealthy"}, 503
+    return {"status": "unhealthy"}, 503
 
 
 if __name__ == "__main__":
