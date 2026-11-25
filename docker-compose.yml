@@ -1,0 +1,50 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: devops
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?required}
+      MYSQL_USER: flaskuser
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?required}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - two-tier
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  flask:
+    image: flask-app:latest
+    build:
+      context: .
+    ports:
+      - "5000:5000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_USER: flaskuser
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?required}
+      MYSQL_DB: devops
+    networks:
+      - two-tier
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  mysql-data:
+
+networks:
+  two-tier:
+    driver: bridge
