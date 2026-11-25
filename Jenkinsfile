@@ -13,7 +13,8 @@ pipeline {
         MYSQL_ROOT_PASSWORD = credentials('mysql-root-password')
         MYSQL_PASSWORD = credentials('mysql-app-password')
 
-        PREVIOUS_IMAGE = ''
+        STATE_FILE = '/var/lib/jenkins/deployment-state/flask-app/last-good-image'
+        COMPOSE_PROJECT = 'two-tier-flask-pipeline'
     }
 
     stages {
@@ -49,7 +50,9 @@ pipeline {
 
         stage('Authenticate with ECR') {
             steps {
-                sh '''
+                sh '''#!/bin/bash
+                    set -euo pipefail
+
                     aws ecr get-login-password --region "$AWS_REGION" | \
                     docker login --username AWS --password-stdin "$ECR_REGISTRY"
                 '''
@@ -68,64 +71,107 @@ pipeline {
             }
         }
 
-        stage('Capture Previous Stable Image') {
+        stage('Validate Rollback Image') {
             steps {
-                script {
-                    sh 'curl -fsS --max-time 15 http://localhost:5000/health'
+                sh '''
+                    test -s "$STATE_FILE"
 
-                    env.PREVIOUS_IMAGE = sh(
-                        script: '''
-                            docker inspect --format='{{.Config.Image}}' \
-                            two-tier-flask-pipeline-flask-1
-                        ''',
-                        returnStdout: true
-                    ).trim()
+                    previous_image=$(cat "$STATE_FILE")
 
-                    echo "Previous stable image: ${env.PREVIOUS_IMAGE}"
-                }
+                    case "$previous_image" in
+                        "$ECR_REGISTRY/$ECR_REPOSITORY":build-*)
+                            echo "Last known good image: $previous_image"
+                            ;;
+                        *)
+                            echo "Invalid rollback image"
+                            exit 1
+                            ;;
+                    esac
+
+                    docker image inspect "$previous_image" >/dev/null 2>&1 || \
+                    docker pull "$previous_image"
+                '''
             }
         }
 
         stage('Deploy and Verify Application') {
             steps {
                 script {
+
+                    def previousImage = sh(
+                        script: 'cat "$STATE_FILE"',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Rollback target: ${previousImage}"
+
                     try {
                         sh '''
-                            docker compose -p two-tier-flask-pipeline up \
-                            -d --no-build --no-deps --wait --wait-timeout 120 flask
+                            docker compose -p "$COMPOSE_PROJECT" up \
+                            -d --no-build --no-deps --wait \
+                            --wait-timeout 120 flask
+
+                            curl -fsS --max-time 15 \
+                            http://localhost:5000/health
+
+                            actual_image=$(docker inspect \
+                            --format='{{.Config.Image}}' \
+                            "${COMPOSE_PROJECT}-flask-1")
+
+                            test "$actual_image" = "$FLASK_IMAGE"
                         '''
 
-                        sh 'curl -fsS --max-time 15 http://localhost:5000/health'
-
-                        echo "New deployment successful"
+                        echo 'New deployment successful'
 
                     } catch (Exception deploymentError) {
 
                         echo 'New deployment failed'
-                        echo "Initiating automatic rollback to ${env.PREVIOUS_IMAGE}"
+                        echo "Initiating automatic rollback to ${previousImage}"
 
                         try {
-                            withEnv(["FLASK_IMAGE=${env.PREVIOUS_IMAGE}"]) {
+                            withEnv(["FLASK_IMAGE=${previousImage}"]) {
                                 sh '''
-                                    docker compose -p two-tier-flask-pipeline pull flask
+                                    docker image inspect "$FLASK_IMAGE" >/dev/null 2>&1 || \
+                                    docker pull "$FLASK_IMAGE"
 
-                                    docker compose -p two-tier-flask-pipeline up \
-                                    -d --no-build --no-deps --wait --wait-timeout 120 flask
+                                    docker compose -p "$COMPOSE_PROJECT" up \
+                                    -d --no-build --no-deps --wait \
+                                    --wait-timeout 120 flask
 
-                                    curl -fsS --max-time 15 http://localhost:5000/health
+                                    curl -fsS --max-time 15 \
+                                    http://localhost:5000/health
+
+                                    actual_image=$(docker inspect \
+                                    --format='{{.Config.Image}}' \
+                                    "${COMPOSE_PROJECT}-flask-1")
+
+                                    test "$actual_image" = "$FLASK_IMAGE"
                                 '''
                             }
 
-                            echo "Automatic rollback successful"
-                            echo "Restored image: ${env.PREVIOUS_IMAGE}"
+                            echo 'Automatic rollback successful'
+                            echo "Restored image: ${previousImage}"
 
                         } catch (Exception rollbackError) {
                             error('Automatic rollback failed. Manual intervention required.')
                         }
 
-                        error('New deployment failed. Previous stable version restored.')
+                        error('New deployment failed. Previous stable image restored.')
                     }
                 }
+            }
+        }
+
+        stage('Update Last Known Good Image') {
+            steps {
+                sh '''
+                    printf '%s\\n' "$FLASK_IMAGE" > "${STATE_FILE}.tmp"
+
+                    mv "${STATE_FILE}.tmp" "$STATE_FILE"
+
+                    echo "Updated last known good image:"
+                    cat "$STATE_FILE"
+                '''
             }
         }
     }
