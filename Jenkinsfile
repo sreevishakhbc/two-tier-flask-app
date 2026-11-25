@@ -12,6 +12,8 @@ pipeline {
 
         MYSQL_ROOT_PASSWORD = credentials('mysql-root-password')
         MYSQL_PASSWORD = credentials('mysql-app-password')
+
+        PREVIOUS_IMAGE = ''
     }
 
     stages {
@@ -66,27 +68,76 @@ pipeline {
             }
         }
 
-        stage('Deploy Application') {
+        stage('Capture Previous Stable Image') {
             steps {
-                sh 'docker compose up -d --no-build --wait'
+                script {
+                    sh 'curl -fsS --max-time 15 http://localhost:5000/health'
+
+                    env.PREVIOUS_IMAGE = sh(
+                        script: '''
+                            docker inspect --format='{{.Config.Image}}' \
+                            two-tier-flask-pipeline-flask-1
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Previous stable image: ${env.PREVIOUS_IMAGE}"
+                }
             }
         }
 
-        stage('Verify Deployment') {
+        stage('Deploy and Verify Application') {
             steps {
-                sh 'curl -fsS --max-time 15 http://localhost:5000/health'
+                script {
+                    try {
+                        sh '''
+                            docker compose -p two-tier-flask-pipeline up \
+                            -d --no-build --no-deps --wait --wait-timeout 120 flask
+                        '''
+
+                        sh 'curl -fsS --max-time 15 http://localhost:5000/health'
+
+                        echo "New deployment successful"
+
+                    } catch (Exception deploymentError) {
+
+                        echo 'New deployment failed'
+                        echo "Initiating automatic rollback to ${env.PREVIOUS_IMAGE}"
+
+                        try {
+                            withEnv(["FLASK_IMAGE=${env.PREVIOUS_IMAGE}"]) {
+                                sh '''
+                                    docker compose -p two-tier-flask-pipeline pull flask
+
+                                    docker compose -p two-tier-flask-pipeline up \
+                                    -d --no-build --no-deps --wait --wait-timeout 120 flask
+
+                                    curl -fsS --max-time 15 http://localhost:5000/health
+                                '''
+                            }
+
+                            echo "Automatic rollback successful"
+                            echo "Restored image: ${env.PREVIOUS_IMAGE}"
+
+                        } catch (Exception rollbackError) {
+                            error('Automatic rollback failed. Manual intervention required.')
+                        }
+
+                        error('New deployment failed. Previous stable version restored.')
+                    }
+                }
             }
         }
     }
 
     post {
         success {
-            echo "Application deployed successfully"
+            echo 'Application deployed successfully'
             echo "Deployed image: ${env.FLASK_IMAGE}"
         }
 
         failure {
-            echo 'Deployment failed'
+            echo 'Pipeline failed. Review console output.'
         }
 
         always {
