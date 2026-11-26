@@ -14,7 +14,9 @@ pipeline {
         MYSQL_PASSWORD = credentials('mysql-app-password')
 
         STATE_FILE = '/var/lib/jenkins/deployment-state/flask-app/last-good-image'
+        RELEASE_HISTORY = '/var/lib/jenkins/deployment-state/flask-app/release-history'
         COMPOSE_PROJECT = 'two-tier-flask-pipeline'
+        
     }
 
     stages {
@@ -162,18 +164,32 @@ pipeline {
             }
         }
 
-        stage('Update Last Known Good Image') {
-            steps {
-                sh '''
-                    printf '%s\\n' "$FLASK_IMAGE" > "${STATE_FILE}.tmp"
 
-                    mv "${STATE_FILE}.tmp" "$STATE_FILE"
+stage('Update Deployment State') {
+    steps {
+        sh '''
+            # Update Last Known Good image
+            printf '%s\\n' "$FLASK_IMAGE" > "${STATE_FILE}.tmp"
+            mv "${STATE_FILE}.tmp" "$STATE_FILE"
 
-                    echo "Updated last known good image:"
-                    cat "$STATE_FILE"
-                '''
-            }
-        }
+            # Register verified release
+            touch "$RELEASE_HISTORY"
+
+            if ! grep -Fxq "$IMAGE_TAG" "$RELEASE_HISTORY"; then
+                printf '%s\\n' "$IMAGE_TAG" >> "$RELEASE_HISTORY"
+                echo "Registered new release: $IMAGE_TAG"
+            else
+                echo "Release already registered: $IMAGE_TAG"
+            fi
+
+            echo "===== LAST KNOWN GOOD IMAGE ====="
+            cat "$STATE_FILE"
+
+            echo "===== VERIFIED RELEASE HISTORY ====="
+            cat "$RELEASE_HISTORY"
+        '''
+    }
+}
     }
 
     post {
